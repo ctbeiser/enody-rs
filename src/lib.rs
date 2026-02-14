@@ -17,6 +17,8 @@ pub mod spectral;
 pub mod update;
 #[cfg(feature = "remote")]
 pub mod usb;
+#[cfg(feature = "visualize")]
+pub mod visualize;
 
 pub type Identifier = uuid::Uuid;
 pub type Measurement = f32;

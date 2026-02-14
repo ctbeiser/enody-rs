@@ -21,8 +21,8 @@ pub trait Source: Send + Sync {
 pub mod remote {
     use crate::{
         message::{
-            Command, CommandMessage, Configuration, Event, Flux, SourceCommand, SourceEvent,
-            SourceInfo,
+            Command, CommandMessage, Configuration, EmitterCommand, EmitterInfo, Event, Flux,
+            SourceCommand, SourceEvent, SourceInfo,
         },
         runtime::remote::RemoteRuntime,
         Identifier,
@@ -32,6 +32,7 @@ pub mod remote {
     ///
     /// RemoteSource wraps a cloned RemoteRuntime and provides access to
     /// source operations through the command/event protocol.
+    #[derive(Clone)]
     pub struct RemoteSource {
         info: SourceInfo,
         remote: RemoteRuntime,
@@ -76,6 +77,41 @@ pub mod remote {
                 Event::Source(SourceEvent::Display(config, flux)) => Ok((config, flux)),
                 _ => Err(crate::Error::UnexpectedResponse),
             }
+        }
+
+        /// Query emitter info by index.
+        pub async fn emitter_info(&self, index: u32) -> Result<EmitterInfo, crate::Error> {
+            let command = Command::Source(SourceCommand::EmitterInfo(index));
+            let command_message = CommandMessage::root(command, Some(self.identifier()));
+
+            let event_message = self.remote.execute_command(command_message).await?;
+
+            match event_message.event {
+                Event::Source(SourceEvent::EmitterInfo(info)) => Ok(info),
+                _ => Err(crate::Error::UnexpectedResponse),
+            }
+        }
+
+        /// Enumerate all emitter identifiers in this source.
+        pub async fn emitters(&self) -> Result<Vec<Identifier>, crate::Error> {
+            let count = self.emitter_count().await?;
+            let mut ids = Vec::new();
+            for i in 0..count {
+                let info = self.emitter_info(i).await?;
+                ids.push(info.identifier);
+            }
+            Ok(ids)
+        }
+
+        /// Set the flux on a specific emitter (fire-and-forget).
+        pub async fn set_emitter_flux(
+            &self,
+            emitter_id: Identifier,
+            flux: Flux,
+        ) -> Result<(), crate::Error> {
+            let command = Command::Emitter(EmitterCommand::FluxSet(flux));
+            let command_message = CommandMessage::root(command, Some(emitter_id));
+            self.remote.send_command(command_message).await
         }
     }
 }
