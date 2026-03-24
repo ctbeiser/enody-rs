@@ -101,6 +101,23 @@ enum Commands {
         rate: f32,
     },
 
+    /// Run a continuous light show showcasing device capabilities
+    Demo {
+        /// Target framerate in fps (default: 60, max: 240)
+        #[arg(short, long, default_value_t = 60.0)]
+        rate: f32,
+    },
+
+    /// Interactively probe device gamut
+    Gamut {
+        /// Grid resolution (default: 5, meaning 6x6 grid)
+        #[arg(short, long, default_value_t = 5)]
+        steps: u32,
+        /// Target relative flux (0.0 to 1.0, default: 0.8)
+        #[arg(short, long, default_value_t = 0.8)]
+        flux: f32,
+    },
+
     /// Update selected device to newest firmware
     Update {
         /// Path to an offline firmware image (.bin)
@@ -149,6 +166,8 @@ async fn main() -> Result<(), enody::Error> {
             )
             .await?
         }
+        Commands::Demo { rate } => demo(rate, cli.verbose).await?,
+        Commands::Gamut { steps, flux } => gamut(steps, flux).await?,
         Commands::Update { firmware } => enody::update::update_remote_host(firmware).await?,
     }
 
@@ -452,6 +471,178 @@ async fn strobe(
     vprintln!(verbose, "{} cycles in {:.2}s", cycles, duration);
 
     Ok(())
+}
+
+
+async fn gamut(steps: u32, flux: f32) -> Result<(), enody::Error> {
+    use enody::message::{Chromaticity, Configuration, Flux};
+    use std::io::{self, BufRead, Write};
+
+    let environment = UsbEnvironment::new();
+    let runtimes = environment.runtimes();
+
+    if runtimes.is_empty() {
+        println!("No Enody devices found.");
+        return Ok(());
+    }
+
+    let runtime = &runtimes[0];
+    let host = runtime.host().await?;
+    let fixtures = host.fixtures().await?;
+    let fixture = &fixtures[0];
+
+    println!("Gamut probe: {}x{} grid, flux={}", steps + 1, steps + 1, flux);
+    println!("For each point: [y]es / [n]o / [q]uit (default: yes)");
+    println!();
+
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+
+    for xi in 0..=steps {
+        for yi in 0..=steps {
+            let x = 0.1 + 0.5 * (xi as f32 / steps as f32);
+            let y = 0.1 + 0.5 * (yi as f32 / steps as f32);
+
+            let config = Configuration::Chromatic(Chromaticity { x, y });
+            let timeout = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                fixture.display(config, Flux::Relative(flux)),
+            )
+            .await;
+
+            if timeout.is_err() {
+                println!("({:.2}, {:.2})  timed out, skipping", x, y);
+                bad.push((x, y));
+                continue;
+            }
+
+            print!("({:.2}, {:.2}) ? ", x, y);
+            io::stdout().flush().unwrap();
+
+            let input = lines.next().unwrap_or(Ok(String::new())).unwrap_or_default();
+            let input = input.trim().to_lowercase();
+
+            if input == "q" {
+                break;
+            } else if input == "n" {
+                bad.push((x, y));
+            } else {
+                good.push((x, y));
+            }
+        }
+    }
+
+    // Turn off
+    let _ = fixture
+        .display(Configuration::Blackbody(2700.0), Flux::Relative(0.0))
+        .await;
+
+    println!("\n=== Results ===");
+    println!("In-gamut ({}):", good.len());
+    for (x, y) in &good {
+        println!("  ({:.2}, {:.2})", x, y);
+    }
+    println!("Out-of-gamut ({}):", bad.len());
+    for (x, y) in &bad {
+        println!("  ({:.2}, {:.2})", x, y);
+    }
+
+    Ok(())
+}
+
+async fn demo(rate: f32, verbose: bool) -> Result<(), enody::Error> {
+    use enody::message::{Chromaticity, Configuration, Flux};
+    use std::time::Duration;
+
+    let environment = UsbEnvironment::new();
+    let runtimes = environment.runtimes();
+
+    if runtimes.is_empty() {
+        vprintln!(verbose, "No Enody devices found.");
+        return Ok(());
+    }
+
+    let mut fixtures = Vec::new();
+    for (index, runtime) in runtimes.iter().enumerate() {
+        let Ok(host) = runtime.host().await else {
+            vprintln!(verbose, "Failed to query host on runtime {}", index + 1);
+            continue;
+        };
+
+        let Ok(f) = host.fixtures().await else {
+            vprintln!(verbose, "Failed to discover fixtures on runtime {}", index + 1);
+            continue;
+        };
+        fixtures.extend(f);
+    }
+
+    if fixtures.is_empty() {
+        vprintln!(verbose, "No fixtures found.");
+        return Ok(());
+    }
+
+    println!("Running demo on {} fixture(s). Press Ctrl+C to exit.", fixtures.len());
+
+    // Initialize all fixtures to Blackbody mode
+    for fixture in &fixtures {
+        let _ = fixture
+            .display(Configuration::Blackbody(2700.0), Flux::Relative(0.0))
+            .await;
+    }
+
+    let capped_rate = rate.min(240.0);
+    let frame_duration = Duration::from_secs_f32(1.0 / capped_rate);
+    let mut interval = tokio::time::interval(frame_duration);
+
+    // Chromaticity waypoints — smooth fade through the full color range
+    let color_points: &[(f32, f32)] = &[
+        (0.45, 0.41),  // warm white
+        (0.55, 0.40),  // amber
+        (0.45, 0.50),  // yellow-green
+        (0.30, 0.50),  // green
+        (0.20, 0.35),  // cyan
+        (0.20, 0.18),  // blue
+        (0.30, 0.20),  // violet
+        (0.45, 0.30),  // pink/magenta
+        (0.33, 0.33),  // neutral white
+        (0.45, 0.41),  // back to warm white
+    ];
+
+    // ~4 seconds per segment
+    let seconds_per_segment = 4.0;
+    let segment_count = color_points.len() - 1;
+    let total_duration = seconds_per_segment * segment_count as f32;
+
+    let mut elapsed = 0.0f32;
+    let dt = 1.0 / capped_rate;
+
+    loop {
+        interval.tick().await;
+        let phase_time = elapsed % total_duration;
+
+        let pos = phase_time / seconds_per_segment;
+        let index = (pos as usize).min(segment_count - 1);
+        let frac = pos - index as f32;
+        let (x0, y0) = color_points[index];
+        let (x1, y1) = color_points[index + 1];
+        let x = x0 + (x1 - x0) * frac;
+        let y = y0 + (y1 - y0) * frac;
+        let config = Configuration::Chromatic(Chromaticity { x, y });
+        let flux = Flux::Relative(0.8);
+
+        for fixture in &fixtures {
+            match fixture.display(config.clone(), flux.clone()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    vprintln!(verbose, "Display error: {:?} (config={:?})", e, config);
+                }
+            }
+        }
+
+        elapsed += dt;
+    }
 }
 
 async fn fade(

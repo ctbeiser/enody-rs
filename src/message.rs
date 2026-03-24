@@ -200,7 +200,7 @@ pub enum EmitterEvent {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct EmitterInfo {
-    identifier: Identifier,
+    pub identifier: Identifier,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

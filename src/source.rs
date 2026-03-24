@@ -21,8 +21,8 @@ pub trait Source: Send + Sync {
 pub mod remote {
     use crate::{
         message::{
-            Command, CommandMessage, Configuration, Event, Flux, SourceCommand, SourceEvent,
-            SourceInfo,
+            Command, CommandMessage, Configuration, EmitterInfo,
+            Event, Flux, SourceCommand, SourceEvent, SourceInfo,
         },
         runtime::remote::RemoteRuntime,
         Identifier,
@@ -57,6 +57,19 @@ pub mod remote {
 
             match event_message.event {
                 Event::Source(SourceEvent::EmitterCount(count)) => Ok(count),
+                _ => Err(crate::Error::UnexpectedResponse),
+            }
+        }
+
+        /// Fetch information about a specific emitter by index.
+        pub async fn emitter_info(&self, index: u32) -> Result<EmitterInfo, crate::Error> {
+            let command = Command::Source(SourceCommand::EmitterInfo(index));
+            let command_message = CommandMessage::root(command, Some(self.identifier()));
+
+            let event_message = self.remote.execute_command(command_message).await?;
+
+            match event_message.event {
+                Event::Source(SourceEvent::EmitterInfo(info)) => Ok(info),
                 _ => Err(crate::Error::UnexpectedResponse),
             }
         }
