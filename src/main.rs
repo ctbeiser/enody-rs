@@ -5,6 +5,8 @@ use enody::{
 };
 use std::path::PathBuf;
 
+mod mixer;
+
 macro_rules! vprintln {
     ($verbose:expr, $($arg:tt)*) => {
         if $verbose {
@@ -125,6 +127,9 @@ enum Commands {
         output: String,
     },
 
+    /// Interactive per-emitter flux mixer
+    Mixer,
+
     /// Update selected device to newest firmware
     Update {
         /// Path to an offline firmware image (.bin)
@@ -177,6 +182,7 @@ async fn main() -> Result<(), enody::Error> {
             )
             .await?
         }
+        Commands::Mixer => mixer::run().await?,
         Commands::Scan { flux, duration } => scan(flux, duration).await?,
         Commands::DownloadSpectralData { output } => download_spectral_data(&output).await?,
         Commands::Update { firmware, force } => {
