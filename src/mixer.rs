@@ -33,8 +33,8 @@ enum UIEntry {
         spectrum: Option<Vec<f32>>,
         peak_nm: f32,
         color_name: &'static str,
-        handle_index: usize,
-        source_entry_index: usize,
+        handle_indices: Vec<usize>,
+        source_entry_indices: Vec<usize>,
     },
 }
 
@@ -50,7 +50,6 @@ impl UIEntry {
             UIEntry::Source { flux, .. } | UIEntry::Emitter { flux, .. } => *flux = new,
         }
     }
-
 }
 
 enum DeviceCommand {
@@ -104,9 +103,12 @@ pub async fn run() -> Result<(), enody::Error> {
             };
             let base_source_index = all_sources.len();
 
-            for (si, source) in sources.iter().enumerate() {
+            // First pass: add source entries
+            let mut src_entry_indices = Vec::new();
+            for (si, _source) in sources.iter().enumerate() {
                 let source_index = base_source_index + si;
                 let source_entry_index = ui_entries.len();
+                src_entry_indices.push(source_entry_index);
 
                 ui_entries.push(UIEntry::Source {
                     label: format!("S{}", source_index),
@@ -114,7 +116,12 @@ pub async fn run() -> Result<(), enody::Error> {
                     source_index,
                 });
                 num_sources += 1;
+            }
 
+            // Second pass: add emitter entries, grouped by emitter_index
+            let mut emitter_entry_map: HashMap<usize, usize> = HashMap::new();
+
+            for (si, source) in sources.iter().enumerate() {
                 let Ok(emitters) = source.emitters().await else {
                     continue;
                 };
@@ -144,20 +151,37 @@ pub async fn run() -> Result<(), enody::Error> {
                     };
 
                     let handle_index = handles.len();
-                    ui_entries.push(UIEntry::Emitter {
-                        label: format!("F{}S{}E{}", fi, si, ei),
-                        flux: 0.0,
-                        spectrum,
-                        peak_nm,
-                        color_name: wavelength_color(peak_nm),
-                        handle_index,
-                        source_entry_index,
-                    });
                     handles.push(EmitterHandle {
                         fixture: fixture.clone(),
-                        source_index,
+                        source_index: base_source_index + si,
                         emitter,
                     });
+
+                    if let Some(&entry_idx) = emitter_entry_map.get(&ei) {
+                        // Add handle to existing grouped entry
+                        if let UIEntry::Emitter {
+                            handle_indices,
+                            source_entry_indices,
+                            ..
+                        } = &mut ui_entries[entry_idx]
+                        {
+                            handle_indices.push(handle_index);
+                            source_entry_indices.push(src_entry_indices[si]);
+                        }
+                    } else {
+                        // Create new grouped entry
+                        let entry_idx = ui_entries.len();
+                        emitter_entry_map.insert(ei, entry_idx);
+                        ui_entries.push(UIEntry::Emitter {
+                            label: format!("F{}E{}", fi, ei),
+                            flux: 0.0,
+                            spectrum,
+                            peak_nm,
+                            color_name: wavelength_color(peak_nm),
+                            handle_indices: vec![handle_index],
+                            source_entry_indices: vec![src_entry_indices[si]],
+                        });
+                    }
                 }
             }
 
@@ -380,15 +404,22 @@ async fn mixer_loop(
         }
 
         if changed {
-            let cmd = match &entries[selected] {
+            match &entries[selected] {
                 UIEntry::Source {
                     source_index, flux, ..
-                } => DeviceCommand::SetSource(*source_index, *flux),
+                } => {
+                    let _ = tx.try_send(DeviceCommand::SetSource(*source_index, *flux));
+                }
                 UIEntry::Emitter {
-                    handle_index, flux, ..
-                } => DeviceCommand::SetEmitter(*handle_index, *flux),
+                    handle_indices,
+                    flux,
+                    ..
+                } => {
+                    for &hi in handle_indices {
+                        let _ = tx.try_send(DeviceCommand::SetEmitter(hi, *flux));
+                    }
+                }
             };
-            let _ = tx.try_send(cmd);
         }
 
         let max_visible = MAX_VISIBLE.min(entries.len());
@@ -601,17 +632,19 @@ fn compute_total_spectrum(entries: &[UIEntry]) -> Vec<f32> {
         if let UIEntry::Emitter {
             flux,
             spectrum: Some(spec),
-            source_entry_index,
+            source_entry_indices,
             ..
         } = entry
         {
             if *flux > 0.0 {
-                let source_flux = entries[*source_entry_index].flux();
-                if source_flux > 0.0 {
-                    let scale = *flux * source_flux;
-                    for (i, &v) in spec.iter().enumerate() {
-                        if i < total.len() {
-                            total[i] += v * scale;
+                for &sei in source_entry_indices {
+                    let source_flux = entries[sei].flux();
+                    if source_flux > 0.0 {
+                        let scale = *flux * source_flux;
+                        for (i, &v) in spec.iter().enumerate() {
+                            if i < total.len() {
+                                total[i] += v * scale;
+                            }
                         }
                     }
                 }
@@ -628,11 +661,14 @@ fn compute_source_spectrum(entries: &[UIEntry], source_entry_idx: usize) -> Vec<
         if let UIEntry::Emitter {
             flux,
             spectrum: Some(spec),
-            source_entry_index,
+            source_entry_indices,
             ..
         } = entry
         {
-            if *source_entry_index == source_entry_idx && *flux > 0.0 && source_flux > 0.0 {
+            if source_entry_indices.contains(&source_entry_idx)
+                && *flux > 0.0
+                && source_flux > 0.0
+            {
                 let scale = *flux * source_flux;
                 for (i, &v) in spec.iter().enumerate() {
                     if i < total.len() {
