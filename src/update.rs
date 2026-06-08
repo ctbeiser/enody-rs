@@ -235,10 +235,40 @@ impl EP01UpdateTarget {
         self.flash_payloads(&[(FIRMWARE_FLASH_OFFSET, image)])
     }
 
+    /// Flash payloads, retrying the full connect + write sequence on failure.
+    ///
+    /// The ESP32-C6's USB-Serial-JTAG command channel intermittently drops
+    /// early ROM commands (notably `SPI_ATTACH` at the start of a write),
+    /// which surfaces as a transient `Timeout(SpiAttach)`. A clean reconnect
+    /// usually succeeds, so we retry the whole sequence a few times before
+    /// giving up.
     pub fn flash_payloads(&self, payloads: &[(u32, Vec<u8>)]) -> Result<(), Error> {
+        const FLASH_ATTEMPTS: u32 = 3;
+        const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+        let mut last_err = None;
+        for attempt in 1..=FLASH_ATTEMPTS {
+            match self.flash_payloads_once(payloads) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    log::warn!("Flash attempt {attempt}/{FLASH_ATTEMPTS} failed: {e:?}");
+                    if attempt < FLASH_ATTEMPTS {
+                        println!("  Flash attempt {attempt} failed, retrying...");
+                        std::thread::sleep(RETRY_DELAY);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| Error::Debug("Flashing failed".into())))
+    }
+
+    fn flash_payloads_once(&self, payloads: &[(u32, Vec<u8>)]) -> Result<(), Error> {
         use espflash::cli::EspflashProgress;
         use espflash::connection::{Connection, ResetAfterOperation, ResetBeforeOperation};
         use espflash::flasher::Flasher;
+        use espflash::image_format::Segment;
         use espflash::target::Chip;
         use serialport::FlowControl;
 
@@ -268,6 +298,12 @@ impl EP01UpdateTarget {
 
         let mut progress = EspflashProgress::default();
 
+        // Write every payload in a single flasher session. Each individual
+        // `write_bin_to_flash` would reboot the device out of download mode on
+        // completion, so flashing multiple payloads one-at-a-time causes the
+        // second `SPI_ATTACH` to time out. `write_bins_to_flash` performs a
+        // single attach and a single reboot for the whole set.
+        let mut segments: Vec<Segment<'_>> = Vec::with_capacity(payloads.len());
         for (i, (offset, data)) in payloads.iter().enumerate() {
             println!(
                 "  Writing payload {}/{} ({} bytes at offset {:#x})...",
@@ -276,15 +312,15 @@ impl EP01UpdateTarget {
                 data.len(),
                 offset
             );
-            flasher
-                .write_bin_to_flash(*offset, data, &mut progress)
-                .map_err(|e| Error::Debug(format!("Failed to flash firmware: {:?}", e)))?;
+            let mut segment = Segment::new(*offset, data);
+            // Flash writes must be word-aligned.
+            segment.pad_align(4);
+            segments.push(segment);
         }
 
         flasher
-            .connection()
-            .reset()
-            .map_err(|e| Error::Debug(format!("Failed to reset device after flash: {:?}", e)))?;
+            .write_bins_to_flash(&segments, &mut progress)
+            .map_err(|e| Error::Debug(format!("Failed to flash firmware: {:?}", e)))?;
 
         Ok(())
     }
